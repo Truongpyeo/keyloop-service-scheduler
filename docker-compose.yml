@@ -1,0 +1,37 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: scheduler
+      MYSQL_USER: scheduler
+      MYSQL_PASSWORD: secret
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # Ping over TCP: during first-time init MySQL runs a socket-only temporary server, which would pass a socket ping too early.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  app:
+    build: .
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_DATABASE: scheduler
+      DB_USERNAME: scheduler
+      DB_PASSWORD: secret
+      # Several built-in server workers so parallel requests are really handled in parallel (needs --no-reload).
+      PHP_CLI_SERVER_WORKERS: 4
+
+volumes:
+  mysql-data:
