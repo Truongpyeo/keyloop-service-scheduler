@@ -24,3 +24,9 @@ Tool: Claude Code + Laravel Boost (MCP). For each step: what I asked, what the A
 
 - Kết quả trong Docker: health 200 khi DB chạy, 503 khi tắt MySQL; 7/7 test pass trong container (sau khi sửa force="true").
 - Ghi chú cho README: người chấm dùng Windows PowerShell 5.1 phải gõ curl.exe (curl là alias của Invoke-WebRequest).
+
+## Step 4 – Data model
+- Prompt: 8 bảng theo DESIGN.md, FK restrict, 4 index, seed dữ liệu demo cố định.
+- AI tự phát hiện: cast immutable_datetime không tự đổi sang UTC → ghi chú cho bước 5 phải gọi ->utc() trước khi lưu.
+- Tôi kiểm tra trên MySQL thật (SHOW CREATE TABLE): [kiểu cột starts_at, số index, FK restrict].
+- Test trong Docker: [số test pass]. Seed không chạy lại khi restart.

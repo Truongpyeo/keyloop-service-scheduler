@@ -1,21 +1,21 @@
 <?php
 
-use App\Models\User;
+use App\Models\Dealership;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
 
 uses(LazilyRefreshDatabase::class);
 
-it('seeds the database when it has no data', function () {
+it('seeds the database when it has no dealerships', function () {
     $this->artisan('app:seed-if-empty')->assertSuccessful();
 
-    $this->assertDatabaseHas('users', ['email' => 'test@example.com']);
+    $this->assertDatabaseHas('dealerships', ['name' => 'Keyloop Da Nang']);
 });
 
-it('does not seed the database when it already has data', function () {
-    User::factory()->create(['email' => 'existing@example.com']);
+it('does not seed the database when a dealership already exists', function () {
+    Dealership::factory()->create(['name' => 'Existing Dealership']);
 
     $this->artisan('app:seed-if-empty')->assertSuccessful();
 
-    $this->assertDatabaseCount('users', 1);
-    $this->assertDatabaseMissing('users', ['email' => 'test@example.com']);
+    $this->assertDatabaseCount('dealerships', 1);
+    $this->assertDatabaseMissing('dealerships', ['name' => 'Keyloop Da Nang']);
 });
