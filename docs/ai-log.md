@@ -34,3 +34,7 @@ Tool: Claude Code + Laravel Boost (MCP). For each step: what I asked, what the A
 - Kết quả kiểm tra Docker (AI chạy, tôi đọc output): 66/66 test pass; 11 kịch bản API đạt (201, 200 idempotent, 409 no_technician_available, 409 vehicle_already_booked, 422 thiếu offset, 422 cùng key khác body, hủy idempotent, slot trống lại sau hủy). MySQL lưu 09:00+07:00 thành 02:00 UTC.
 - Log: mọi log ứng dụng có request_id; dòng truy cập của php artisan serve thì không (ghi vào giới hạn đã biết).
 
+## Step 6 – Concurrency verification
+- Prompt: lệnh app:concurrency-test gửi request song song thật (Http::pool) vào MySQL trong Docker, 3 kịch bản, kiểm tra trùng giờ bằng SQL tự join độc lập với code đặt lịch.
+- Kết quả 2 lần chạy (AI chạy, tôi đọc output và tự query MySQL): A 1/10 thành công (1 KTV EV), B 3/5 (3 bay), C 1 lịch cho 10 request cùng key; overlapping_pairs = 0; không có 503/deadlock.
+- Xác nhận thêm trên dữ liệu thật: giờ lưu UTC; quy tắc chọn KTV ít lịch nhất, hòa thì id nhỏ.
