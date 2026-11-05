@@ -3,8 +3,11 @@
 namespace App\Models;
 
 use App\Enums\AppointmentStatus;
+use Carbon\CarbonImmutable;
 use Database\Factories\AppointmentFactory;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
+use Illuminate\Database\Eloquent\Attributes\Scope;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -73,6 +76,33 @@ class Appointment extends Model
     public function serviceBay(): BelongsTo
     {
         return $this->belongsTo(ServiceBay::class);
+    }
+
+    /**
+     * Limit the query to appointments that still hold their resources.
+     *
+     * @param  Builder<self>  $query
+     */
+    #[Scope]
+    protected function confirmed(Builder $query): void
+    {
+        $query->where('status', AppointmentStatus::Confirmed);
+    }
+
+    /**
+     * Limit the query to appointments overlapping [startsAt, endsAt).
+     *
+     * Appointments never span more than one local day, so the extra lower bound on starts_at
+     * is always safe and keeps the scan on the (resource_id, starts_at) indexes short.
+     *
+     * @param  Builder<self>  $query
+     */
+    #[Scope]
+    protected function overlapping(Builder $query, CarbonImmutable $startsAt, CarbonImmutable $endsAt): void
+    {
+        $query->where('starts_at', '<', $endsAt->utc())
+            ->where('starts_at', '>', $startsAt->utc()->subDay())
+            ->where('ends_at', '>', $startsAt->utc());
     }
 
     /**

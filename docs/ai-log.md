@@ -30,3 +30,7 @@ Tool: Claude Code + Laravel Boost (MCP). For each step: what I asked, what the A
 - AI tự phát hiện: cast immutable_datetime không tự đổi sang UTC → ghi chú cho bước 5 phải gọi ->utc() trước khi lưu.
 - Tôi kiểm tra trên MySQL thật (SHOW CREATE TABLE): [kiểu cột starts_at, số index, FK restrict].
 - Test trong Docker: [số test pass]. Seed không chạy lại khi restart.
+
+- Kết quả kiểm tra Docker (AI chạy, tôi đọc output): 66/66 test pass; 11 kịch bản API đạt (201, 200 idempotent, 409 no_technician_available, 409 vehicle_already_booked, 422 thiếu offset, 422 cùng key khác body, hủy idempotent, slot trống lại sau hủy). MySQL lưu 09:00+07:00 thành 02:00 UTC.
+- Log: mọi log ứng dụng có request_id; dòng truy cập của php artisan serve thì không (ghi vào giới hạn đã biết).
+

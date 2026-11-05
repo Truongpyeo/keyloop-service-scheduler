@@ -30,6 +30,9 @@ services:
       DB_DATABASE: scheduler
       DB_USERNAME: scheduler
       DB_PASSWORD: secret
+      # Structured JSON logs on stderr, visible with `docker compose logs app`.
+      LOG_CHANNEL: stderr
+      LOG_STDERR_FORMATTER: Monolog\Formatter\JsonFormatter
       # Several built-in server workers so parallel requests are really handled in parallel (needs --no-reload).
       PHP_CLI_SERVER_WORKERS: 4
 

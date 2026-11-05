@@ -6,6 +6,7 @@ use App\Models\ServiceBay;
 use App\Models\ServiceType;
 use App\Models\Technician;
 use App\Models\Vehicle;
+use Carbon\CarbonImmutable;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
 
 uses(LazilyRefreshDatabase::class);
@@ -52,6 +53,18 @@ it('seeds technicians covering every skill, with exactly one EV technician', fun
     expect($skillSets)->toContain(['general']);
     expect($skillSets)->toContain(['brakes', 'general']);
     expect($skillSets->filter(fn (array $skills) => in_array('ev', $skills))->count())->toBe(1);
+});
+
+it('seeds data where every service type has at least one bookable slot tomorrow', function () {
+    $this->travelTo(CarbonImmutable::parse('2026-11-04T10:00:00+07:00'));
+    $this->seed();
+    $dealership = Dealership::sole();
+
+    foreach (ServiceType::all() as $serviceType) {
+        $this->getJson(route('dealerships.availability', [$dealership, 'service_type_id' => $serviceType->id, 'date' => '2026-11-05']))
+            ->assertOk()
+            ->assertJsonPath('data.slots.0.starts_at', '2026-11-05T08:00:00+07:00');
+    }
 });
 
 it('seeds three customers who each own one or two vehicles with 17-character VINs', function () {

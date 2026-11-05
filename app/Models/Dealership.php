@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use Carbon\CarbonImmutable;
 use Database\Factories\DealershipFactory;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
@@ -36,5 +37,42 @@ class Dealership extends Model
     public function appointments(): HasMany
     {
         return $this->hasMany(Appointment::class);
+    }
+
+    /**
+     * Opening time on the local date of the given instant, in the dealership's timezone.
+     */
+    public function opensOn(CarbonImmutable $day): CarbonImmutable
+    {
+        return $day->setTimezone($this->timezone)->setTimeFromTimeString($this->opens_at);
+    }
+
+    /**
+     * Closing time on the local date of the given instant, in the dealership's timezone.
+     */
+    public function closesOn(CarbonImmutable $day): CarbonImmutable
+    {
+        return $day->setTimezone($this->timezone)->setTimeFromTimeString($this->closes_at);
+    }
+
+    /**
+     * Whether a service starting and ending at the given instants fits inside one local day's opening hours.
+     */
+    public function isOpenThroughout(CarbonImmutable $startsAt, CarbonImmutable $endsAt): bool
+    {
+        return $startsAt->greaterThanOrEqualTo($this->opensOn($startsAt))
+            && $endsAt->lessThanOrEqualTo($this->closesOn($startsAt));
+    }
+
+    /**
+     * The local calendar day containing the given instant, as a [start, end) range in UTC.
+     *
+     * @return array{0: CarbonImmutable, 1: CarbonImmutable}
+     */
+    public function localDayInUtc(CarbonImmutable $day): array
+    {
+        $startOfDay = $day->setTimezone($this->timezone)->startOfDay();
+
+        return [$startOfDay->utc(), $startOfDay->addDay()->utc()];
     }
 }

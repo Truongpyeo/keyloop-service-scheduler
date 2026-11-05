@@ -28,7 +28,7 @@ flowchart LR
     Browser -->|fetch /api/*| MW
     subgraph App["Laravel 13 app container (php:8.4-cli)"]
         Demo["Blade demo page<br/>(optional)"]
-        MW["Middleware<br/>RequestId · JSON errors"] --> C["Controllers"]
+        MW["Middleware<br/>AssignRequestId · JSON errors"] --> C["Controllers"]
         C --> FR["Form Requests<br/>(validation)"]
         C --> AS["AvailabilityService"]
         C --> BS["BookingService"]
@@ -36,18 +36,18 @@ flowchart LR
         BS --> M
     end
     M -->|SQL, transactions,<br/>SELECT ... FOR UPDATE| DB[("MySQL 8.4<br/>(InnoDB, own container)")]
-    App -->|JSON logs| Out["stdout / log file"]
+    App -->|JSON logs| Out["stderr (docker compose logs)"]
 ```
 
 ## 3. Components and their roles
 
 | Component | Role |
 |---|---|
-| `RequestId` middleware | Reads `X-Request-Id` or generates a UUID, adds it to the log context and echoes it in the response header. |
+| `AssignRequestId` middleware | Reads `X-Request-Id` or generates a UUID, adds it to the log context and echoes it in the response header. |
 | Form Requests | Validate input shape (`starts_at` ISO 8601 with offset), existence of referenced records and business rules (vehicle belongs to customer, slot alignment, start and end within opening hours in the dealership's timezone, in the future). Failures → 422. |
 | Controllers | Thin HTTP layer: map requests to services, services to API Resources and status codes. |
 | `AvailabilityService` | For one local date, loads skilled technicians, bays and the dealership's non-cancelled appointments in that day's UTC window (~3 queries), then builds 30-minute slots in memory, applying the same opening-hours rule and keeping slots where at least one skilled technician and one bay are free for the full duration. |
-| `BookingService` | Runs the transactional booking: lock vehicle and candidates, locking re-check of overlaps, pick technician and bay, insert appointment, handle idempotency and retries. |
+| `BookingService` | Runs the transactional booking: lock skilled technicians, bays and the vehicle (in that order), look up the Idempotency-Key, locking re-check of overlaps, pick technician and bay, insert appointment, handle idempotency and retries. |
 | API Resources | Stable JSON representation of appointments and slots. |
 | Blade demo page (optional) | A single simple page that calls the same public REST API (via `fetch`) to show free slots and book an appointment. It is a client test harness only, with no logic of its own; the assessed deliverable is the backend. |
 | Exception handler | Renders all errors as JSON (`message`, optional `errors`) with 404 / 409 / 422, and 503 + `Retry-After` for database failures. |
@@ -113,7 +113,7 @@ Indexes on `appointments`: `(technician_id, starts_at)`, `(service_bay_id, start
 
 | Method & path | Purpose | Success | Errors |
 |---|---|---|---|
-| `GET /api/dealerships/{id}/availability?service_type_id=&date=` | Free start times (UTC + local) for the service on that local date. Exactly one date per request | 200 | 404, 422, 503 |
+| `GET /api/dealerships/{id}/availability?service_type_id=&date=` | Free start and end times, ISO 8601 in the dealership's local time, for the service on that local date. Exactly one date per request | 200 | 404, 422, 503 |
 | `POST /api/appointments` | Book. Body: `customer_id`, `vehicle_id`, `dealership_id`, `service_type_id`, `starts_at` (ISO 8601 with offset or `Z`). Optional `Idempotency-Key` header | 201 (200 on replay) | 404, 409, 422, 503 |
 | `GET /api/appointments/{id}` | Fetch one appointment with technician and bay | 200 | 404 |
 | `PATCH /api/appointments/{id}/cancel` | Set status to `cancelled`, freeing the resources (no-op if already cancelled) | 200 | 404 |
@@ -125,7 +125,7 @@ Error codes:
 
 - **422:** invalid input (including `starts_at` without offset), a business rule such as outside opening hours, or `Idempotency-Key reused with a different payload`.
 - **404:** unknown resource.
-- **409:** no free bay or skilled technician for the requested window, or the vehicle already has an overlapping appointment.
+- **409:** JSON `{message, reason}`; `reason` is `no_skilled_technician`, `no_technician_available`, `no_bay_available` or `vehicle_already_booked`.
 - **503:** deadlock still failing after retries, lock wait timeout or lost DB connection. JSON body with a `Retry-After` header.
 
 ## 6. Booking data flow
@@ -143,22 +143,24 @@ sequenceDiagram
     API->>API: Require local starts_at ≥ opens_at AND local ends_at ≤ closes_at → else 422
     API->>BS: book(data, K)
     BS->>BS: H = SHA-256(canonical body, starts_at normalized to UTC)
-    BS->>DB: SELECT appointment WHERE idempotency_key = K
+    Note over BS,DB: DB::transaction(..., attempts: 3)
+    BS->>DB: BEGIN
+    BS->>DB: SELECT skilled technicians ... ORDER BY id FOR UPDATE
+    BS->>DB: SELECT service bays ... ORDER BY id FOR UPDATE
+    BS->>DB: SELECT vehicle WHERE id = ? FOR UPDATE
+    BS->>DB: SELECT appointment WHERE idempotency_key = K FOR UPDATE (after the locks, see §7)
     alt key used with same hash H
         DB-->>BS: existing appointment (confirmed or cancelled)
+        BS->>DB: COMMIT (nothing written)
         BS-->>C: 200 existing appointment
     else key used with a different hash
+        BS->>DB: ROLLBACK
         BS-->>C: 422 Idempotency-Key reused with a different payload
-    else new key
-        Note over BS,DB: DB::transaction(..., attempts: 3)
-        BS->>DB: BEGIN
-        BS->>DB: SELECT vehicle WHERE id = ? FOR UPDATE
-        BS->>DB: SELECT skilled technicians ... ORDER BY id FOR UPDATE
-        BS->>DB: SELECT service bays ... ORDER BY id FOR UPDATE
-        BS->>DB: Locking re-check: SELECT overlapping appointments (vehicle, technicians, bays, status != cancelled) FOR UPDATE
-        alt vehicle already booked, or no free technician, or no free bay
+    else new key, or no key
+        BS->>DB: Locking re-check per vehicle, technicians, bays: confirmed rows with starts_at < new_end AND ends_at > new_start AND starts_at > new_start − 1 day, FOR UPDATE
+        alt vehicle already booked, no skilled technician, no free technician, or no free bay
             BS->>DB: ROLLBACK
-            BS-->>C: 409 Conflict (+ log booking.failed with reason)
+            BS-->>C: 409 Conflict + reason (+ log booking.failed)
         else resources free
             BS->>BS: Pick technician with fewest appointments that local day, first free bay
             BS->>DB: INSERT appointment (status = confirmed, idempotency_key = K, request_hash = H)
@@ -167,15 +169,18 @@ sequenceDiagram
         end
     end
     Note over BS,DB: Deadlock 1213 or lock wait timeout 1205 → retried. After the last attempt, or on lost connection → 503 + Retry-After
+    Note over BS,DB: Unique violation on idempotency_key (same key racing) → read the committed row, compare hashes → 200 or 422
 ```
 
 ## 7. Concurrency & consistency
 
-- **Pessimistic locking on parent rows.** Inside a DB transaction the booking locks, with `SELECT ... FOR UPDATE` (`lockForUpdate()`), the vehicle row, then the dealership's candidate `technicians`, then its `service_bays`, each in ascending `id` order. Every booking takes locks in this same order to avoid deadlocks. A second request for the same resources waits until the first commits.
+- **Pessimistic locking on parent rows.** Inside a DB transaction the booking locks, with `SELECT ... FOR UPDATE` (`lockForUpdate()`), the dealership's skilled `technicians`, then its `service_bays`, then the `vehicle` row, each set in ascending `id` order. Every booking takes locks in this same order (technicians → bays → vehicle), so two bookings can never wait on each other in a cycle. A second request for the same resources waits until the first commits.
 - **The re-check is a locking read.** The availability shown by `GET /availability` is only advisory; the overlap check is repeated after acquiring the locks, and that query also uses `lockForUpdate()`. Under InnoDB's default REPEATABLE READ, a plain `SELECT` reads from the snapshot taken at the transaction's first consistent read. It could therefore miss an appointment that a concurrent transaction committed while this one was waiting for the lock. A locking read always reads the latest committed rows ([MySQL 8.4: Consistent Nonlocking Reads](https://dev.mysql.com/doc/refman/8.4/en/innodb-consistent-read.html)), so two concurrent requests cannot both pass the check.
+- **Bounded locking read.** Each re-check (vehicle, technicians, bays) is its own query on the matching `(…_id, starts_at)` index, with an extra lower bound `starts_at > new_start − 1 day`. An appointment never spans more than one local day, so any overlapping row must start within the previous 24 hours; the bound changes no result, but it stops the range scan, and the next-key locks it takes, from covering the resource's whole booking history.
 - **Vehicle overlap.** The same locking re-check covers `vehicle_id`, so one vehicle cannot be double-booked at the same or another dealership (409).
 - **Retries and failures.** The booking runs in `DB::transaction(..., attempts: 3)`. Laravel retries the whole transaction on concurrency errors: deadlock (1213) and lock wait timeout (1205). If the last attempt still fails, or the connection is lost, the API returns 503 JSON with `Retry-After` and logs the reason. With MySQL's default 50 s lock wait timeout, a worst-case request can wait several times that before the 503 (tuning is out of scope, §11).
 - **Idempotency.** The `Idempotency-Key` is stored on the appointment with a unique index, together with `request_hash`. That hash is the SHA-256 of the canonicalized body, with `starts_at` normalized to UTC.
+  - **Looked up after the locks, with a locking read.** If the key were checked before locking, a retry sent while the first request is still in flight would find nothing (the first insert is not committed yet), then wait on the resource locks, then see the resources busy and answer 409 instead of returning the booking it duplicates. Same-key requests carry the same body, so they lock the same rows; checking the key after the locks means the retry waits for the first request to commit and then finds its appointment.
   - **Same key, same hash:** returns the stored appointment with 200, even if it has since been cancelled.
   - **Same key, different hash:** rejected with 422 `Idempotency-Key reused with a different payload`, so a key can never silently map to a different booking.
   - **Same key racing:** if two requests with the same key run concurrently, the unique constraint rejects the second insert. That error is caught after the rollback, and the same hash comparison decides between 200 and 422.
@@ -193,12 +198,13 @@ sequenceDiagram
 
 ## 9. Observability strategy
 
-- **Structured JSON logs** (Monolog JSON formatter) to stdout, every line carrying `request_id`, method, path, status and duration.
-- **Request correlation:** `RequestId` middleware propagates `X-Request-Id` in the log context and response header.
-- **Domain events:** `booking.succeeded` (appointment, technician, bay, dealership IDs) and `booking.failed` with a `reason`:
-  - `validation_failed`, `outside_opening_hours`, `idempotency_key_mismatch`, `not_found`
-  - `vehicle_already_booked`, `no_technician_available`, `no_bay_available`
-  - `db_deadlock`, `db_lock_timeout`, `db_unavailable`
+- **Structured JSON logs** (Monolog JSON formatter) to stderr, visible with `docker compose logs app`. Every application log line carries `request_id`; each request also ends with a `request.completed` line holding method, path, status and `duration_ms`.
+- **Request correlation:** `AssignRequestId` middleware reuses a safe caller `X-Request-Id` (or generates a UUID), adds it to the log context and echoes it in the response header.
+- **Domain events:** `booking.succeeded` (appointment, technician, bay, dealership IDs), `booking.replayed`, `booking.cancelled`, and `booking.failed` with a `reason`:
+  - `validation_failed`, `outside_opening_hours`, `idempotency_key_mismatch`
+  - `vehicle_already_booked`, `no_skilled_technician`, `no_technician_available`, `no_bay_available`
+- **Database failures:** `database.unavailable` with `reason` `db_deadlock`, `db_lock_timeout` or `db_unavailable`, alongside the 503 response.
+- **Demo web server caveat:** the container runs PHP's built-in server via `php artisan serve`, which prints its own plain-text access line per request (`2026-11-04 09:53:45 /api/appointments ... ~ 0.08ms`). Those lines are not application logs, carry no `request_id`, and their timing is not the real request duration (use `duration_ms` from `request.completed`). The built-in server is for the demo only; production should run nginx + php-fpm or Laravel Octane, whose access logs can include the `X-Request-Id` header.
 - **Health check:** `GET /api/health` runs a trivial DB query; returns 503 if the database is unreachable, for use by load balancers / orchestrators.
 - **Future:** Prometheus metrics (booking rate, 409/503 rate, latency histograms, lock wait time) and OpenTelemetry tracing across HTTP and DB spans.
 
