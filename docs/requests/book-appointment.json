@@ -1,0 +1,8 @@
+{
+  "_note": "Replace <FUTURE-DATE> with a date after today (YYYY-MM-DD). starts_at must keep its UTC offset (+07:00) or use Z. This field is ignored by the API.",
+  "customer_id": 1,
+  "vehicle_id": 2,
+  "dealership_id": 1,
+  "service_type_id": 3,
+  "starts_at": "<FUTURE-DATE>T14:00:00+07:00"
+}

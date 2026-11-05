@@ -1,0 +1,560 @@
+openapi: 3.1.0
+info:
+  title: Unified Service Scheduler API
+  version: 1.0.0
+  description: |
+    Keyloop Technical Assessment, Scenario A (backend only).
+
+    Books a service appointment for a vehicle at a dealership only if a service bay and a technician with the
+    required skill are both free for the whole service duration.
+
+    - All times are ISO 8601. Requests must carry an explicit UTC offset or `Z`; storage is UTC.
+    - Opening hours and the `date` parameter are interpreted in the dealership's timezone.
+    - Every response carries an `X-Request-Id` header (the caller's value when it is safe, otherwise a generated UUID).
+    - No authentication (out of scope for the assessment).
+servers:
+  - url: http://localhost:8000
+    description: Docker Compose stack
+
+tags:
+  - name: Availability
+  - name: Appointments
+  - name: Operations
+
+paths:
+  /api/health:
+    get:
+      tags: [Operations]
+      summary: Liveness and database connectivity
+      operationId: getHealth
+      parameters:
+        - $ref: '#/components/parameters/XRequestId'
+      responses:
+        '200':
+          description: The API is up and can reach the database.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: ok
+                database: up
+        '503':
+          description: The database is unreachable.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: error
+                database: down
+
+  /api/dealerships/{dealership}/availability:
+    get:
+      tags: [Availability]
+      summary: Free start times for a service on one local date
+      description: |
+        Slots start every 30 minutes from opening time. A slot is listed when it starts in the future, ends by
+        closing time, and at least one technician with the required skill and one bay are free for the whole service.
+        Times are returned in the dealership's local time.
+      operationId: getAvailability
+      parameters:
+        - name: dealership
+          in: path
+          required: true
+          schema:
+            type: integer
+          example: 1
+        - name: service_type_id
+          in: query
+          required: true
+          schema:
+            type: integer
+          example: 3
+        - name: date
+          in: query
+          required: true
+          description: Local date at the dealership, `YYYY-MM-DD`.
+          schema:
+            type: string
+            format: date
+          example: '2026-11-06'
+        - $ref: '#/components/parameters/XRequestId'
+      responses:
+        '200':
+          description: The free slots (possibly empty).
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailabilityResponse'
+              example:
+                data:
+                  dealership_id: 1
+                  service_type_id: 3
+                  date: '2026-11-06'
+                  timezone: Asia/Ho_Chi_Minh
+                  slots:
+                    - starts_at: '2026-11-06T08:00:00+07:00'
+                      ends_at: '2026-11-06T10:00:00+07:00'
+                    - starts_at: '2026-11-06T08:30:00+07:00'
+                      ends_at: '2026-11-06T10:30:00+07:00'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/appointments:
+    post:
+      tags: [Appointments]
+      summary: Book an appointment
+      description: |
+        Locks the dealership's skilled technicians, its bays and the vehicle (in that order), re-checks overlaps with
+        locking reads, then assigns the free technician with the fewest appointments that local day (ties: lowest id)
+        and the free bay with the lowest id.
+
+        Send an `Idempotency-Key` to make retries safe: the same key with the same body returns the original
+        appointment with 200 (even if it was cancelled since); the same key with a different body returns 422.
+      operationId: bookAppointment
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: Client-chosen key (max 255 characters) identifying this booking attempt.
+          schema:
+            type: string
+            maxLength: 255
+          example: booking-7f3c2a
+        - $ref: '#/components/parameters/XRequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BookAppointmentRequest'
+            example:
+              customer_id: 1
+              vehicle_id: 2
+              dealership_id: 1
+              service_type_id: 3
+              starts_at: '2026-11-06T09:00:00+07:00'
+      responses:
+        '201':
+          description: The appointment was booked.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppointmentResponse'
+              examples:
+                appointment:
+                  $ref: '#/components/examples/Appointment'
+        '200':
+          description: Idempotent replay; the appointment created earlier with this key and body.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppointmentResponse'
+        '409':
+          description: No vehicle, technician or bay slot is free for the whole requested time.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConflictError'
+              examples:
+                noTechnicianAvailable:
+                  value:
+                    message: No skilled technician is free for the whole requested time.
+                    reason: no_technician_available
+                noBayAvailable:
+                  value:
+                    message: No service bay is free for the whole requested time.
+                    reason: no_bay_available
+                noSkilledTechnician:
+                  value:
+                    message: No technician at this dealership has the skill this service requires.
+                    reason: no_skilled_technician
+                vehicleAlreadyBooked:
+                  value:
+                    message: The vehicle already has an appointment that overlaps this time.
+                    reason: vehicle_already_booked
+        '422':
+          description: |
+            Invalid input or business rule: missing fields, unknown ids, `starts_at` without offset, not on a 30-minute
+            boundary in local time, in the past, outside opening hours, vehicle not owned by the customer, or an
+            Idempotency-Key reused with a different payload.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+              examples:
+                missingOffset:
+                  value:
+                    message: The starts at field must be an ISO 8601 date-time with a UTC offset or Z, e.g. 2026-11-05T09:00:00+07:00.
+                    errors:
+                      starts_at:
+                        - The starts at field must be an ISO 8601 date-time with a UTC offset or Z, e.g. 2026-11-05T09:00:00+07:00.
+                outsideOpeningHours:
+                  value:
+                    message: The service must start at or after 08:00 and finish by 18:00 (Asia/Ho_Chi_Minh).
+                    errors:
+                      starts_at:
+                        - The service must start at or after 08:00 and finish by 18:00 (Asia/Ho_Chi_Minh).
+                idempotencyKeyReused:
+                  value:
+                    message: Idempotency-Key reused with a different payload.
+                    errors:
+                      idempotency_key:
+                        - Idempotency-Key reused with a different payload.
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/appointments/{appointment}:
+    get:
+      tags: [Appointments]
+      summary: Show an appointment
+      operationId: getAppointment
+      parameters:
+        - $ref: '#/components/parameters/AppointmentId'
+        - $ref: '#/components/parameters/XRequestId'
+      responses:
+        '200':
+          description: The appointment with its technician, bay, service type and vehicle.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppointmentResponse'
+              examples:
+                appointment:
+                  $ref: '#/components/examples/Appointment'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/appointments/{appointment}/cancel:
+    patch:
+      tags: [Appointments]
+      summary: Cancel an appointment
+      description: Frees the technician and bay. Cancelling an already cancelled appointment also returns 200.
+      operationId: cancelAppointment
+      parameters:
+        - $ref: '#/components/parameters/AppointmentId'
+        - $ref: '#/components/parameters/XRequestId'
+      responses:
+        '200':
+          description: The appointment, now with status `cancelled`.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppointmentResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+components:
+  parameters:
+    AppointmentId:
+      name: appointment
+      in: path
+      required: true
+      schema:
+        type: integer
+      example: 1
+    XRequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: Correlation id echoed back and attached to every log line. Up to 128 characters of `A-Z a-z 0-9 . _ -`; anything else is replaced by a UUID.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9._-]{1,128}$'
+      example: demo-trace-1
+
+  headers:
+    XRequestId:
+      description: The request id used in the logs for this request.
+      schema:
+        type: string
+      example: demo-trace-1
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema:
+        type: integer
+      example: 5
+
+  responses:
+    NotFound:
+      description: Unknown dealership or appointment.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            message: Appointment not found.
+    ValidationError:
+      description: Invalid input.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ValidationError'
+          example:
+            message: The date field must match the format Y-m-d.
+            errors:
+              date:
+                - The date field must match the format Y-m-d.
+    ServiceUnavailable:
+      description: A deadlock persisted after 3 attempts, a lock wait timed out, or the database connection was lost. Safe to retry.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ServiceUnavailableError'
+          example:
+            message: The service is temporarily unavailable. Please retry shortly.
+            reason: db_deadlock
+
+  schemas:
+    Health:
+      type: object
+      required: [status, database]
+      properties:
+        status:
+          type: string
+          enum: [ok, error]
+        database:
+          type: string
+          enum: [up, down]
+
+    BookAppointmentRequest:
+      type: object
+      required: [customer_id, vehicle_id, dealership_id, service_type_id, starts_at]
+      properties:
+        customer_id:
+          type: integer
+        vehicle_id:
+          type: integer
+          description: Must belong to `customer_id`.
+        dealership_id:
+          type: integer
+        service_type_id:
+          type: integer
+        starts_at:
+          type: string
+          format: date-time
+          description: Future ISO 8601 date-time with an offset or `Z`, on a 30-minute boundary in the dealership's local time.
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?(Z|[+-]\d{2}:\d{2})$'
+
+    Slot:
+      type: object
+      required: [starts_at, ends_at]
+      properties:
+        starts_at:
+          type: string
+          format: date-time
+        ends_at:
+          type: string
+          format: date-time
+
+    AvailabilityResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [dealership_id, service_type_id, date, timezone, slots]
+          properties:
+            dealership_id:
+              type: integer
+            service_type_id:
+              type: integer
+            date:
+              type: string
+              format: date
+            timezone:
+              type: string
+              example: Asia/Ho_Chi_Minh
+            slots:
+              type: array
+              items:
+                $ref: '#/components/schemas/Slot'
+
+    Instant:
+      type: object
+      required: [utc, local]
+      properties:
+        utc:
+          type: string
+          format: date-time
+          example: '2026-11-06T02:00:00Z'
+        local:
+          type: string
+          format: date-time
+          example: '2026-11-06T09:00:00+07:00'
+
+    Appointment:
+      type: object
+      required: [id, status, starts_at, ends_at, timezone, customer_id, dealership, vehicle, service_type, technician, service_bay]
+      properties:
+        id:
+          type: integer
+        status:
+          type: string
+          enum: [confirmed, cancelled]
+        starts_at:
+          $ref: '#/components/schemas/Instant'
+        ends_at:
+          $ref: '#/components/schemas/Instant'
+        timezone:
+          type: string
+        customer_id:
+          type: integer
+        dealership:
+          type: object
+          properties:
+            id: { type: integer }
+            name: { type: string }
+        vehicle:
+          type: object
+          properties:
+            id: { type: integer }
+            vin: { type: string, minLength: 17, maxLength: 17 }
+            make: { type: string }
+            model: { type: string }
+            year: { type: integer }
+        service_type:
+          type: object
+          properties:
+            id: { type: integer }
+            name: { type: string }
+            duration_minutes: { type: integer }
+        technician:
+          type: object
+          properties:
+            id: { type: integer }
+            name: { type: string }
+        service_bay:
+          type: object
+          properties:
+            id: { type: integer }
+            name: { type: string }
+
+    AppointmentResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Appointment'
+
+    Error:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+
+    ConflictError:
+      type: object
+      required: [message, reason]
+      properties:
+        message:
+          type: string
+        reason:
+          type: string
+          enum: [no_skilled_technician, no_technician_available, no_bay_available, vehicle_already_booked]
+
+    ValidationError:
+      type: object
+      required: [message, errors]
+      properties:
+        message:
+          type: string
+        errors:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+
+    ServiceUnavailableError:
+      type: object
+      required: [message, reason]
+      properties:
+        message:
+          type: string
+        reason:
+          type: string
+          enum: [db_deadlock, db_lock_timeout, db_unavailable]
+
+  examples:
+    Appointment:
+      summary: A confirmed EV battery check
+      value:
+        data:
+          id: 1
+          status: confirmed
+          starts_at:
+            utc: '2026-11-06T02:00:00Z'
+            local: '2026-11-06T09:00:00+07:00'
+          ends_at:
+            utc: '2026-11-06T04:00:00Z'
+            local: '2026-11-06T11:00:00+07:00'
+          timezone: Asia/Ho_Chi_Minh
+          customer_id: 1
+          dealership:
+            id: 1
+            name: Keyloop Da Nang
+          vehicle:
+            id: 2
+            vin: RLLV2ACE6PH000101
+            make: VinFast
+            model: VF 8
+            year: 2023
+          service_type:
+            id: 3
+            name: EV battery check
+            duration_minutes: 120
+          technician:
+            id: 4
+            name: Dung Pham
+          service_bay:
+            id: 1
+            name: Bay 1

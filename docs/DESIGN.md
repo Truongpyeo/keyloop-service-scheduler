@@ -24,10 +24,8 @@ Assumptions:
 ```mermaid
 flowchart LR
     Client["Client<br/>(cURL / OpenAPI)"] -->|HTTPS JSON| MW
-    Browser["Browser"] -->|GET demo page| Demo
-    Browser -->|fetch /api/*| MW
     subgraph App["Laravel 13 app container (php:8.4-cli)"]
-        Demo["Blade demo page<br/>(optional)"]
+        Demo["app:demo<br/>(CLI client, separate process)"]
         MW["Middleware<br/>AssignRequestId · JSON errors"] --> C["Controllers"]
         C --> FR["Form Requests<br/>(validation)"]
         C --> AS["AvailabilityService"]
@@ -35,6 +33,7 @@ flowchart LR
         AS --> M["Eloquent models"]
         BS --> M
     end
+    Demo -->|HTTP JSON to localhost:8000| MW
     M -->|SQL, transactions,<br/>SELECT ... FOR UPDATE| DB[("MySQL 8.4<br/>(InnoDB, own container)")]
     App -->|JSON logs| Out["stderr (docker compose logs)"]
 ```
@@ -49,7 +48,7 @@ flowchart LR
 | `AvailabilityService` | For one local date, loads skilled technicians, bays and the dealership's non-cancelled appointments in that day's UTC window (~3 queries), then builds 30-minute slots in memory, applying the same opening-hours rule and keeping slots where at least one skilled technician and one bay are free for the full duration. |
 | `BookingService` | Runs the transactional booking: lock skilled technicians, bays and the vehicle (in that order), look up the Idempotency-Key, locking re-check of overlaps, pick technician and bay, insert appointment, handle idempotency and retries. |
 | API Resources | Stable JSON representation of appointments and slots. |
-| Blade demo page (optional) | A single simple page that calls the same public REST API (via `fetch`) to show free slots and book an appointment. It is a client test harness only, with no logic of its own; the assessed deliverable is the backend. |
+| `app:demo` command | CLI client (`php artisan app:demo`) that runs the whole flow over the public REST API for tomorrow in the dealership's timezone: availability → book (201) → replay with the same Idempotency-Key (200) → conflicting booking (409) → missing offset (422) → cancel (200) → slot free again. It prints each request, status and shortened body, uses its own demo customer and vehicles, and contains no booking logic of its own. |
 | Exception handler | Renders all errors as JSON (`message`, optional `errors`) with 404 / 409 / 422, and 503 + `Retry-After` for database failures. |
 
 ## 4. Data model
@@ -229,12 +228,12 @@ sequenceDiagram
   - idempotency: same body → 200, different body → 422, replay after cancel → 200 `cancelled`, and `+07:00` vs `Z` producing the same hash;
   - the opening-hours boundary: a service ending exactly at `closes_at` is accepted, one ending a minute later gets 422;
   - seed sanity: after running the database seeder, availability for tomorrow's local date (time frozen in the test) returns at least one bookable slot for at least one seeded dealership and service type, so reviewers can book right away.
-- **Concurrency against real MySQL:** SQLite ignores `FOR UPDATE` and locks the whole database, so it cannot reproduce InnoDB row locking. `scripts/concurrency-test` therefore fires many parallel `POST /api/appointments` for the same slot at the Docker Compose stack (MySQL 8.4). It asserts that the number of 201 responses equals the number of free resources, that the rest are 409, and that no overlapping rows exist in the database.
+- **Concurrency against real MySQL:** SQLite ignores `FOR UPDATE` and locks the whole database, so it cannot reproduce InnoDB row locking. The artisan command `php artisan app:concurrency-test --force` therefore fires many parallel `POST /api/appointments` (via `Http::pool`) for the same slot at the Docker Compose stack (MySQL 8.4). It asserts that the number of 201 responses equals the number of free resources, that the rest are 409, that a shared Idempotency-Key yields exactly one appointment, and that a SQL self-join finds no overlapping rows in the database.
 
 ## 11. Out of scope
 
 - Authentication, authorization and multi-tenancy.
-- Production frontend UI (replaced by OpenAPI spec and cURL; the optional Blade demo page is only a test harness).
+- Web UI of any kind (the API is exercised through the OpenAPI spec, cURL samples and the `app:demo` CLI client).
 - Technician shifts, breaks, leave and dealership holidays; bay maintenance windows (a future `resource_unavailabilities` table checked in the overlap query).
 - `is_active` flags to deactivate technicians or bays.
 - Validation of seed data beyond the seed sanity test (CHECK constraints on durations and hours, timezone identifier checks).
@@ -253,4 +252,4 @@ I used Claude Code (with Laravel Boost for up-to-date Laravel 13 context) as a d
 2. **I reviewed the gaps it filled.** The AI made six decisions I had not specified. I kept four (lock ordering by id, idempotent cancel, 503 health check, out-of-scope list) and corrected three: it wrote PHPUnit while the project uses Pest; idempotency did not handle the same key with a different payload; and the opening-hours check ignored the end time and the dealership timezone.
 3. **I asked the AI to attack its own design.** Acting as a senior reviewer, it listed eight risks. The most important one: under MySQL REPEATABLE READ, a plain SELECT inside the transaction can read an old snapshot, so the overlap re-check could miss a booking committed by another request. I checked this against the MySQL documentation before accepting it, and changed the re-check to a locking read.
 4. **I decided what to build and what to defer.** I accepted the fixes that protect correctness (snapshot reads, vehicle double-booking, idempotency hash normalisation, deadlock retries) and moved lower-value items (maintenance schedules, seed validation, DST tests) to Out of scope to keep the solution focused.
-5. **I do not rely on AI claims about testing.** SQLite cannot reproduce MySQL locking, so concurrency will be verified with a script that sends parallel requests to a real MySQL instance, not with an in-memory unit test.
+5. **I do not rely on AI claims about testing.** SQLite cannot reproduce MySQL locking, so concurrency is verified with an Artisan command (`php artisan app:concurrency-test --force`) that sends parallel HTTP requests to the real MySQL instance in Docker, not with an in-memory unit test.
